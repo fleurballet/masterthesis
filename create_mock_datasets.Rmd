@@ -1,0 +1,158 @@
+---
+title: "Creating mock datasets"
+author: "Fleur Ballet"
+output: html_document
+date: "2024-05-27"
+---
+
+```{r setup, include = FALSE}
+## Options for Rmarkdown compilation
+knitr::opts_chunk$set(fig.width = 7,
+                      fig.height = 5,
+                      fig.align = "center",
+                      out.width = "70%",
+                      message = FALSE,
+                      collapse = TRUE,
+                      crop = NULL)
+## Time the compilation
+timeStart <- Sys.time()
+```
+
+```{r}
+## Single-cell and protoeomics processing tools
+library("scpdata")
+library("scp")
+## Visualization and manipulation tools
+library("ggplot2")
+library("dplyr")
+library("patchwork")
+
+library("impute")
+library("scater")
+library("msqrob2")
+library("tibble")
+```
+
+# Functions
+
+Define different functions for adapting parts of the existing dataset:
+- to take subsets of the dataset with only one of the cell sample types.
+- to make another dataset where the sample types are randomised.
+- to take a subset of the dataset where we only keep a one sample type per run.
+- to make a dataset with data from one sample type and randomly split into two fake types.
+- to make a dataset with data from one sample type and per run split into two fake types.
+- to insert an effect in another mock dataset.
+
+```{r}
+# take the subset of the sce where the variable takes the given value
+subset_sce <- function(sce, variable, value) {
+  new_sce <- sce
+  new_sce <- new_sce[,colData(new_sce)[,variable] == value]
+  return (new_sce)
+}
+
+# make a new sce where the values of the given variable are randomised
+randomise_variable_sce <- function(sce, variable) {
+  set.seed(123)
+  new_sce <- sce
+  values <- unique(colData(new_sce)[, variable])
+  colData(new_sce)[variable] <- sample(values, ncol(new_sce), replace = TRUE)
+  return (new_sce)
+}
+
+# take a subset of the sce so that in each run there are only samples with the same value for the given variable
+subset_variable_per_run_sce <- function(sce, variable) {
+  set.seed(123)
+  sets <- unique(colData(sce)[["Set"]])
+  for (set in sets) {
+    set <- which(colData(sce)[["Set"]] == set)
+    values <- colData(sce)[set, variable]
+    new_value <- sample(values, 1)
+    new_sce <- sce[,rownames(colData(sce)[,variable==new_value])]
+  }
+  return (new_sce)
+}
+
+# take the subset of the sce for which the given variable takes the given value,
+# then randomly assign two new fake values of this variable to each entry
+subset_and_split_sce <- function(sce, variable, value) {
+  set.seed(123)
+  new_sce <- subset_sce(sce, variable, value)
+  values <- c(paste0(value,"type1"), paste0(value,"type2"))
+  colData(new_sce)[variable] <- sample(values, ncol(new_sce), replace = TRUE)
+  return (new_sce)
+}
+  
+# take the subset of the sce for which the given variable takes the given value,
+# then randomly assign two new fake values of this variable, 
+# so that all entries from the same run take the same new value
+subset_and_split_per_run_sce <- function(sce, variable, value) {
+  set.seed(123)
+  new_sce <- subset_sce(sce, variable, value)
+  values <- c(paste0(value,"type1"), paste0(value,"type2"))
+  sets <- unique(colData(new_sce)[["Set"]])
+  for (set in sets) {
+    set <- which(colData(new_sce)[["Set"]] == set)
+    new_value <- sample(values, 1)
+    colData(new_sce)[set, variable] <- rep(new_value, length(set))
+  }
+  return (new_sce)
+}
+
+# insert an effect in a mock sce by switching the intensities of the entries
+# with the given value for the given variable
+insert_effect <- function(sce, variable, value) {
+  set.seed(123)
+  new_sce <- sce
+  samples <- which(colData(new_sce)[, variable] == value)
+  for (sample in samples) {
+    intensities <- assay(new_sce)[,sample]
+    indices <- sample(1:length(intensities), floor(length(intensities)/5))
+    intensities[indices] <- sample(intensities[indices])
+    assay(new_sce)[,sample] <- intensities
+  }
+  return (new_sce)
+}
+
+# perform the given function with the given arguments on each sce in the list sces
+# and return a list with the adapted sces
+create_dataset_for_all <- function(func, sces, args) {
+  new_sces <- list()
+  for (name in names(sces)) {
+    new_sces[[name]] <- do.call(func, c(sce = sces[[name]], args))
+  }
+  return (new_sces)
+}
+```
+
+
+# Create new datasets
+
+First load the data. This is a list of SingleCellExperiment-assays (as created after "minimal_preprocessing" and "preprocessing_continued").
+
+```{r}
+loadRData <- function(fileName){
+    load(fileName)
+    get(ls()[ls() != "fileName"])
+}
+
+sces <- loadRData("Data/leduc_sces.Rda")
+```
+
+Create the different new datasets with the previously defined functions, for each assay in sces.
+
+```{r}
+sces_subset_split <- create_dataset_for_all(func = subset_and_split_sce, sces, 
+                                        args = list(variable="SampleType", value = "Monocyte"))
+sces_subset_split_per_run <- create_dataset_for_all(func = subset_and_split_per_run_sce, sces, 
+                                        args = list(variable="SampleType", value = "Monocyte"))
+```
+
+# Save results
+
+```{r}
+save(sces_subset_split, file = "Data/leduc_sces_subset_split.Rda")
+save(sces_subset_split_per_run, file = "Data/leduc_sces_subset_split_per_run.Rda")
+```
+
+For the rest of the analyses, we will use "sces" (the real data), and "sces_subset_split" and "sces_subset_split_per_run" (the mock data).
