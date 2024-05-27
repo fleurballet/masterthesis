@@ -13,9 +13,7 @@ knitr::opts_chunk$set(fig.width = 7,
                       out.width = "70%",
                       message = FALSE,
                       collapse = TRUE,
-                      crop = NULL)
-## Time the compilation
-timeStart <- Sys.time()
+                      crop = NULL, warning = FALSE)
 ```
 
 ```{r}
