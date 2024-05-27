@@ -1,0 +1,432 @@
+---
+title: "Data processing - minimal processing (Leduc et al. 2022)"
+author:
+    - Christophe Vanderaa^[christophe.vanderaa@uclouvain.be], Computational Biology, UCLouvain
+    - Laurent Gatto, Computational Biology, UCLouvain
+output:
+    BiocStyle::html_document:
+    self_contained: yes
+toc: true
+toc_float: true
+toc_depth: 2
+code_folding: show
+date: "`r BiocStyle::doc_date()`"
+package: "`r BiocStyle::pkg_ver('SCP.replication')`"
+vignette: >
+    %\VignetteIndexEntry{nPOP replication}
+    %\VignetteEngine{knitr::rmarkdown}
+    %\VignetteEncoding{UTF-8}
+---
+
+```{r setup, include = FALSE}
+## Options for Rmarkdown compilation
+knitr::opts_chunk$set(fig.width = 7,
+                      fig.height = 5,
+                      fig.align = "center",
+                      out.width = "70%",
+                      message = FALSE,
+                      collapse = TRUE,
+                      crop = NULL ## Related to https://stat.ethz.ch/pipermail/bioc-devel/2020-April/016656.html
+)
+## Time the compilation
+timeStart <- Sys.time()
+```
+
+
+# Introduction
+
+Single-cell proteomics is characterized by a large heterogeneity of 
+data analysis practices (Vanderaa2022-qv). We want to provide unified analysis approach
+by limiting the processing steps to what is necessary in order
+to correctly capture the biological information away from the 
+technical variance. There are different types of data (DDA vs DIA, 
+multiplexed vs label-free, timsTOF vs orbitrap, ...), hence there will
+be different types of technical variance. We don't expect one optimal
+workflow to perform optimally on all datasets. Our aim is to provide
+principled practices on how to develop good analysis workflows and 
+providing the tools to perform this assessment. 
+
+We define split SCP data modelling in three steps: data processing, 
+data modelling and model exploration. This vignette is about the first
+step.
+
+We rely on several packages to compile this vignette:
+
+```{r}
+## Single-cell and protoeomics processing tools
+library("scpdata")
+library("scp")
+## Visualization and manipulation tools
+library("ggplot2")
+library("dplyr")
+library("patchwork")
+```
+
+# The dataset
+
+In this vignette, we will focus on the `leduc2022` dataset. The data
+was acquired using the nPOP acquisition protocole. 
+nPOP ([Leduc et al. 2022](http://dx.doi.org/10.1101/2021.04.24.441211))
+is an upgrade of the SCoPE2 protocole ([Specht et al. 2021](http://dx.doi.org/10.1186/s13059-021-02267-5) 
+and [Petelski et al. 2021](http://dx.doi.org/10.1038/s41596-021-00616-z)), 
+where the mPOP sample preparation method is replaced by the nPOP method. nPOP processes
+samples using the Cellenion dispensing device and uses DMSO as lysis 
+reagent instead of a freeze-thaw procedure. They also include the
+prioritized data acquisition mode as described by 
+[Huffman et al. 2022](http://dx.doi.org/10.1101/2022.03.16.484655).
+
+Lets load the dataset: 
+
+```{r}
+leduc <- leduc2022()
+```
+
+We remove the assays that have been already processed by the authors:
+
+```{r}
+leduc <- removeAssay(leduc, c("peptides", "peptides_log",
+                              "proteins_norm2", "proteins_processed"))
+```
+
+The dataset primarily consists of melanoma cells and monocytes. The 
+data set also contains carrier samples, negative control samples, 
+reference samples and empty wells (`Unused`). 
+
+```{r}
+table(leduc$SampleType)
+```
+
+These data were acquired using TMT labelling. Let's reformat the TMT
+label annotations. 
+
+```{r}
+tmtlabs <- c("TMT126", 
+             paste0("TMT", rep(127:134, each = 2), rep(c("N", "C"), 8)),
+             "TMT135N")
+#leduc$Channel <- factor(tmtlabs[as.numeric(sub("RI", "", leduc$Channel))],
+#                         levels = tmtlabs)
+table(leduc$Channel)
+```
+
+As you can see, each label is repeated 134 times. This is because the 
+data was acquired in **134 MS acquisition batches**. 
+
+```{r}
+length(unique(leduc$Set))
+cat(head(leduc$Set), '...', tail(leduc$Set))
+```
+
+Furthermore, samples were prepared with the nPOP protocol using 2 glass
+slides (the batch is annotated with either a heading `e` or `w`), 
+meaning there are 2 sample preparation batches.
+
+```{r}
+table(SampPrepBatch = gsub("^([ew]).*$", "\\1", leduc$Set))
+```
+
+As shown above, the single-cell are either monocytes or melanoma cells.
+
+- Monocytes (U-937) were grown in RPMI, 10\% fetal bovine serum 
+  (potential contaminating proteins?) and 1\% 
+  penicillin-streptomycin. The cells were passaged every 2 days when 
+  $10^6$ cells/ml (non-adherent cells).
+- Melanoma cells (WM989-A6-G from [Emert et al. 2021](https://doi.org/10.1038/s41587-021-00837-3)
+  were grown in 80\% MCDB 153 and 10% Leibovitz L-15 media, 2\% fetal
+  bovine serum (potential contaminating proteins?), 0.5\% 
+  penicillin-streptomycin and 1.68mM Calcium Chloride. The cells were
+  passaged every 3-4 days when cells reached 80 \% confluence 
+  and replated at 30 \%. These adherent cells are detached using 
+  0.25\% Trypsin-EDTA (bias against surface proteins?). 
+
+# The data processing workflow
+
+We identified several SCP data processing categories: 
+
+- Feature and sample quality control
+- Log2-transform
+- Handling missing data: filtering and imputation
+- Aggregation
+- Normalization
+- Batch correction 
+
+Different methods exist for each step and several studies repeat some
+of the steps several times in the same data processing workflow. We 
+believe this complexity is unnecessary and may lead to data 
+over-fitting. As an example, we show below the data processing workflow
+by [Leduc et al. 2022](http://dx.doi.org/10.1101/2021.04.24.441211):
+
+```{r, results='markup', fig.cap="Overview of the processing workflow by Leduc et al.", echo=FALSE, out.width='100%', fig.align='center'}
+#knitr::include_graphics("figs/leduc2022-workflow.png")
+```
+
+In fact, imputation, aggregation, normalization and batch correction
+are methods with associated uncertainty of estimation. Transforming
+the data removes this uncertainty estimation. We therefore suggest to
+remove these steps from data processing and include them as part of the
+data modelling. We suggest that data processing should be limited to the 
+remaining steps that are quality control, log2-transformation, and 
+missing data filtering. How this is implemented may be 
+dataset-dependent. 
+  
+## Cleaning data
+
+First, we replace zeros by missing values. Zero may be measured because
+the feature in the given sample is truly missing, or because of 
+technical limitations. Because we are not able to distinguish between 
+the two, we consider the data to be missing and that it should not be 
+used in later computation.
+
+```{r}
+leduc <- zeroIsNA(leduc, i = names(leduc))
+```
+
+Next, we remove feature annotations that won't be used in the 
+remainder of the vignette. This is to reduce size of the data and safe
+unnecessary computational overhead.
+
+```{r}
+selectRowData(leduc, c("Sequence", "Leading.razor.protein.symbol", 
+                       "Leading.razor.protein.id", "Reverse", 
+                       "Potential.contaminant", "Leading.razor.protein",
+                       "PIF", "dart_qval"))
+```
+
+## Feature quality control
+
+We remove low-quality PSMs that may propagate technical artefacts and
+bias data modelling. The quality contral criteria are:
+
+- Remove contaminants and decoys
+- Remove PSMs with low spectral purity (PIF, parental ion fraction, is
+  computed by MaxQuant)
+- Remove low-confidence peptides (q-values are computed by DART-ID)
+- Remove PSMs for which the single-cell to carrier signal ratio is high
+
+```{r}
+leduc <- computeSCR(leduc, names(leduc),
+                    colvar = "SampleType", 
+                    samplePattern = "Mel|Macro",
+                    carrierPattern = "Carrier",
+                    sampleFUN = "mean",
+                    rowDataName = "MeanSCR")
+
+rbindRowData(leduc, i = 1:length(leduc)) %>%
+   data.frame() %>%
+   ggplot(aes(x = MeanSCR)) + geom_density(fill = "pink") + geom_vline(xintercept = 0.05) +
+     scale_x_log10() + theme_minimal()
+
+leduc <- filterFeatures(leduc, ~ Reverse != "+" &
+                            Potential.contaminant != "+" &
+                            !grepl("REV|CON", Leading.razor.protein) &
+                            !is.na(PIF) & PIF > 0.6 &
+                            dart_qval < 0.01 &
+                            !is.na(MeanSCR) & MeanSCR < 0.05)
+```
+
+## Sample QC 
+
+Similarly to the features, we also remove low-quality cells. These are
+identified based on the median coefficient or variation (CV). The CVs
+are computed for each proteins with at least 3 peptides. The threshold
+is set manually.
+
+```{r}
+leduc <- medianCVperCell(leduc,
+                         i = names(leduc),
+                         groupBy = "Leading.razor.protein.symbol",
+                         nobs = 3,
+                         na.rm = TRUE,
+                         colDataName = "MedianCV",
+                         norm = "sum")
+colData(leduc) %>% 
+    data.frame %>% 
+    filter(grepl("Mono|Mel|Neg", SampleType)) %>% 
+    mutate(control = ifelse(grepl("Neg", SampleType), "no cell", "single-cell")) %>% 
+    ggplot() +
+    aes(x = MedianCV,
+        fill = control) + 
+    geom_density(alpha = 0.5, adjust = 1) +
+    geom_vline(xintercept = 0.6) +
+    theme_minimal()
+```
+
+When applying the filter, we also remove the samples that are not 
+single cells as we will no longer need them. 
+
+```{r}
+leduc <- subsetByColData(leduc,  !is.na(leduc$MedianCV) &
+                             leduc$MedianCV < 0.6 &
+                             grepl("Mono|Mel", leduc$SampleType))
+```
+
+## Building the peptide matrix
+
+For now each MS acquisition run is stored separately in an assay. We 
+here combine these assays in one. The issue is that PSMs are specific
+to each run. We therefore aggregate to peptides.
+
+```{r}
+rdat <- data.frame(rbindRowData(leduc, names(leduc)))
+rdat <- count(rdat, assay, Sequence, name = "nPSM")
+table(PSMperPeptide = rdat$nPSM) / nrow(rdat)
+```
+
+PSMs that map to the same peptides represents less than 10 \%
+of all PSMs. We take the median intensity across this multiple PSMs to
+represent the peptide intensity.
+
+```{r}
+peptideAssays <- paste0("peptides_", names(leduc))
+leduc <- aggregateFeaturesOverAssays(leduc,
+                                     i = names(leduc),
+                                     fcol = "Sequence",
+                                     name = peptideAssays,
+                                     fun = colMedians,
+                                     na.rm = TRUE)
+```
+
+Next to that, we must adapt the peptide to protein mapping. When 
+joining all assay, we will only keep the feature annotations that have
+the common data. However, some peptide sequences map to one protein in one run
+and to another protein in another run. Hence, the protein sequence is
+not constant for all peptides and is removed during joining. It is
+important we keep the protein sequence in the `rowData`, in case we 
+later want to aggregate, model or infer protein level quantification.
+
+```{r}
+rbindRowData(leduc, i = grep("^pep", names(leduc))) %>%
+    data.frame %>%
+    group_by(Sequence) %>%
+    ## The majority vote happens here
+    mutate(Leading.razor.protein.symbol =
+               names(sort(table(Leading.razor.protein.symbol),
+                          decreasing = TRUE))[1],
+           Leading.razor.protein.id =
+               names(sort(table(Leading.razor.protein.id),
+                          decreasing = TRUE))[1]) %>%
+    select(Sequence, Leading.razor.protein.symbol, Leading.razor.protein.id) %>%
+    filter(!duplicated(Sequence, Leading.razor.protein.symbol)) ->
+    ppMap
+consensus <- lapply(peptideAssays, function(i) {
+    ind <- match(rowData(leduc)[[i]]$Sequence, ppMap$Sequence)
+    DataFrame(Leading.razor.protein.symbol =
+                  ppMap$Leading.razor.protein.symbol[ind],
+              Leading.razor.protein.id = 
+                  ppMap$Leading.razor.protein.id[ind])
+})
+names(consensus) <- peptideAssays
+rowData(leduc) <- consensus
+```
+
+The data can now be joined.
+
+```{r}
+leduc <- joinAssays(leduc, i = peptideAssays, 
+                    name = "peptides")
+```
+
+```{r}
+summaryPlot <- leduc[["peptides_log"]][
+    rowData(leduc[["peptides_log"]])$Leading.razor.protein.id == "P16403"] %>%
+  assay %>%
+  as.data.frame %>%
+  rownames_to_column(var = "peptide") %>%
+  gather(sample, intensity, -peptide) %>% 
+  mutate(Set = colData(leduc)[sample,"Set"]) %>%
+  ggplot(aes(x = peptide, y = intensity, color = sample, group = sample), show.legend = FALSE) + #label=Set
+  geom_line(show.legend = FALSE) +
+  #geom_text(show.legend = FALSE) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1)) +
+  xlab("Peptide") + 
+  ylab("Intensity")
+```
+
+
+## Log-transformation
+
+We log2-transform the quantification data. 
+
+```{r}
+leduc <- logTransform(leduc, i = "peptides", name = "peptides_log")
+```
+
+```{r}
+library(gridExtra)
+p1 <- ggplot(data = data.frame(intensity = assay(leduc[["peptides"]]["GTLVQTK",])[1,]), aes(x=intensity)) + xlab("intensity") +
+  geom_histogram() + theme_minimal() + ggtitle("Histogram of intensities for GTLVQTK")
+p2 <- ggplot(data = data.frame(intensity = assay(leduc[["peptides_log"]]["GTLVQTK",])[1,]),
+             aes(x=intensity)) + xlab("log-intensity") +
+  geom_histogram() + theme_minimal() + ggtitle("Histogram of log-intensities for GTLVQTK")
+grid.arrange(p1,p2,ncol=2,nrow=1)
+```
+
+## Missing data filter
+
+SCP data are characterized by many missing data. Below are the missing
+data rates across peptides and across single-cells.
+
+```{r}
+pmispep <- rowMeans(is.na(assay(leduc[["peptides_log"]])))
+pmissc <- colMeans(is.na(assay(leduc[["peptides_log"]])))
+ggplot(data.frame(pmispep = pmispep)) +
+    aes(x = pmispep) +
+    geom_histogram() +
+    labs(title = "Missing data distribution\nalong features",
+        x = "Fraction missing in peptides") + theme_minimal() +
+    ggplot(data.frame(pmissc = pmissc)) +
+    aes(x = pmissc) +
+    geom_histogram() +
+    labs(title = "Missing data distribution\nalong single cells",
+        x = "Fraction missing in single cell") + theme_minimal()
+```
+
+We apply the filters using arbitrary thresholds. Note that allowing
+peptides with at most 50\% missing data removes about 90\% of all 
+peptides. 
+
+```{r}
+leduc <- filterNA(leduc,
+                  i = "peptides_log",
+                  pNA = 0.5)
+leduc <- subsetByColData(leduc, pmissc < 0.95)
+```
+
+## Library size
+
+Finally, we compute size factors for each cell. These can be included 
+during data modelling as a normalization factor or as an offset.
+
+```{r}
+leduc$sizeFactor <- colMedians(assay(leduc[["peptides_log"]]), 
+                               na.rm = TRUE)
+```
+
+# Conclusion
+
+The `leduc` object is the minimally processed data. We will store it
+as an `rda` file. Plotting that object provides an overview of the 
+processing steps and the workflow (use `plot(leduc, interactive = TRUE)`
+for exploring the plot). 
+
+```{r}
+save(leduc, file = "Data/leduc_processed.Rda")
+plot(leduc)
+```
+
+Current limitations of the workflow: 
+
+- Quality control on samples relies on 1 criterion. Designing other 
+  criteria may help identify low quality cells. As shown in the 
+  missing data filtering step, some cells have close to 100\% missing 
+  data rates.
+- Aggregation to peptides using the median may be a bit simplistic. 
+  Better alternatives are median polish or robust summarization. Note 
+  this would require the data to be log-transformed first. Also, we 
+  could aggregate directly to proteins instead of peptides.
+- The peptide to protein remapping to avoid loosing annotations during
+  join is an ugly process. I need to find a way to get rid of this 
+  step...
+- Missing data filtering of 50\% on the features is harsh and removes
+  a majority of the information.
+  
