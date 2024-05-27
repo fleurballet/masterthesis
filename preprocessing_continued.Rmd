@@ -1,0 +1,301 @@
+---
+title: "Data processing - continued (Leduc et al. 2022)"
+author:
+output:
+    BiocStyle::html_document:
+    self_contained: yes
+toc: true
+toc_float: true
+toc_depth: 2
+code_folding: show
+date: "`r BiocStyle::doc_date()`"
+package: "`r BiocStyle::pkg_ver('SCP.replication')`"
+vignette: >
+    %\VignetteIndexEntry{nPOP replication}
+    %\VignetteEngine{knitr::rmarkdown}
+    %\VignetteEncoding{UTF-8}
+---
+
+```{r setup, include = FALSE}
+## Options for Rmarkdown compilation
+knitr::opts_chunk$set(fig.width = 7,
+                      fig.height = 5,
+                      fig.align = "center",
+                      out.width = "70%",
+                      message = FALSE,
+                      collapse = TRUE,
+                      crop = NULL ## Related to https://stat.ethz.ch/pipermail/bioc-devel/2020-April/016656.html
+)
+## Time the compilation
+timeStart <- Sys.time()
+```
+
+```{r}
+## Single-cell and protoeomics processing tools
+library("scpdata")
+library("scp")
+## Visualization and manipulation tools
+library("ggplot2")
+library("dplyr")
+library("patchwork")
+
+library("impute")
+library("tibble")
+library("gridExtra")
+library("tidyr")
+```
+
+
+# Downstream processing similar to scp vignette 
+
+Continue from the minimally processed data from "minimal_preprocessing.Rmd".
+
+```{r}
+load("Data/leduc_processed.Rda")
+```
+
+## Normalisation
+
+```{r}
+## Center columns with median
+leduc <- sweep(leduc, i = "peptides_log",
+             MARGIN = 2,
+             FUN = "-",
+             STATS = colMedians(assay(leduc[["peptides_log"]]),
+                                na.rm = TRUE),
+             name = "peptides_norm_col")
+## Center rows with mean
+leduc <- sweep(leduc, i = "peptides_norm_col",
+             MARGIN = 1,
+             FUN = "-",
+             STATS = rowMeans(assay(leduc[["peptides_norm_col"]]),
+                              na.rm = TRUE),
+             name = "peptides_norm")
+```
+
+Plot the intensity-densities of the samples in 4 runs before and after normalisation:
+
+```{r}
+p1 <- leduc[["peptides_log"]][,colData(leduc)$Set %in% c("eAL00219","wAL00200","eAL00266","wAL00286")] %>% 
+  assay %>%
+  as.data.frame() %>%
+  gather(sample, intensity) %>% 
+  mutate(Set = colData(leduc)[sample,"Set"]) %>%
+  ggplot(aes(x=intensity,group=sample,color=Set)) + 
+    geom_density() +
+    ggtitle("Densities of the intensities in the runs of 4 sets") + theme_minimal()
+
+p2 <- leduc[["peptides_norm"]][,colData(leduc)$Set %in% c("eAL00219","wAL00200","eAL00266","wAL00286")] %>% 
+  assay %>%
+  as.data.frame() %>%
+  gather(sample, intensity) %>% 
+  mutate(Set = colData(leduc)[sample,"Set"]) %>%
+  ggplot(aes(x=intensity,group=sample,color=Set)) + 
+    geom_density() + xlab("normalised intensity") +
+    ggtitle("Densities of the normalised intensities in the runs of 4 sets") + theme_minimal()
+
+grid.arrange(p1,p2,ncol=2,nrow=1)
+```
+
+## Imputation 
+
+The data contains a lot of missing values.
+
+```{r}
+leduc[["peptides_norm"]] %>%
+    assay %>%
+    is.na %>%
+    mean
+```
+
+The average missingness in the peptides assay is around 29 %. Including more samples and hence more batches can increase the missingness up to 70 % as seen for the complete SCoPE2 dataset (Specht et al. (2021)). Whether imputation is beneficial or deleterious for the data will not be discussed in this vignette. But taking those missing value into account is essential to avoid artefacts in downstream analyses. The data imputation is performed using the K nearest neighbors algorithm, with k = 3. This is available from the impute method. More details about the arguments can be found in ?impute::impute.knn.
+
+```{r}
+leduc <- impute(leduc,
+              i = "peptides_norm",
+              name = "peptides_imptd",
+              method = "knn",
+              k = 3, rowmax = 1, colmax= 1,
+              maxp = Inf, rng.seed = 1234)
+```
+
+## Batch correction
+
+A very important step for processing SCP data is to correct for batch effects. Batch effects are caused by technical variation occurring during different MS runs. Since only a small number of single-cells can be acquired at once, batch effects are unavoidable.
+
+The ComBat function from the sva package can be used to perform batch correction as it is performed in the SCoPE2 analysis. We do not claim that ComBat is the best algorithm for batch correcting SCP data and other batch correcting methods could be used using the same procedure.
+
+We first extract the assay to process.
+
+```{r}
+sce <- getWithColData(leduc, "peptides_imptd")
+```
+
+We next create the design matrix. We then perform the batch correction and overwrite the data matrix. Recall the data matrix can be accessed using the assay function.
+
+```{r}
+model <- model.matrix(~ SampleType, data = colData(sce))
+assay(sce) <- limma::removeBatchEffect(x = assay(sce),
+                                batch = sce$lcbatch,
+                                batch2 = sce$Channel,
+                                design = model)
+```
+
+Finally, we add the batch corrected assay to the QFeatures object and create the feature links.
+
+```{r}
+leduc <- addAssay(leduc, y = sce, name = "peptides_batchC")
+leduc <- addAssayLinkOneToOne(leduc, from = "peptides_imptd",
+                              to = "peptides_batchC")
+```
+
+Plot the intensity-densities of the samples in 4 runs before and after batch correction:
+
+```{r}
+p1 <- leduc[["peptides_norm"]][,colData(leduc)$Set %in% c("eAL00219","wAL00200","eAL00266","wAL00286")] %>% 
+  assay %>%
+  as.data.frame() %>%
+  gather(sample, intensity) %>% 
+  mutate(Set = colData(leduc)[sample,"Set"]) %>%
+  ggplot(aes(x=intensity,group=sample,color=Set)) + 
+    geom_density() + xlab("normalised intensity") +
+    ggtitle("Densities of the normalised intensities") + theme_minimal()
+
+p2 <- leduc[["peptides_batchC"]][,colData(leduc)$Set %in% c("eAL00219","wAL00200","eAL00266","wAL00286")] %>% 
+  assay %>%
+  as.data.frame() %>%
+  gather(sample, intensity) %>% 
+  mutate(Set = colData(leduc)[sample,"Set"]) %>%
+  ggplot(aes(x=intensity,group=sample,color=Set)) + 
+    geom_density() + xlab("batch-corrected intensity") +
+    ggtitle("Densities of the batch-corrected intensities") + theme_minimal()
+
+grid.arrange(p1,p2,ncol=2,nrow=1)
+```
+
+For the last time, we plot the overview of the fully processed data set:
+
+```{r}
+plot(leduc)
+```
+
+
+# Ruzincy
+
+We now perform an alternative processing procedure, where we aggregate the original PSM-assays to peptide level by using median sweep.
+
+```{r}
+rawAssays <- 1:134
+peptideAssays <- paste0("peptidesSweepNonNorm_", names(leduc)[rawAssays])
+
+sumFunctionMedianSweep <- function(mx) 
+{
+    mx <- log2(mx)
+    mx <- sweep(mx,
+               MARGIN=1,
+               FUN = "-",
+               STATS = rowMedians(mx,
+                                  na.rm = TRUE))
+    colMedians(mx)
+}
+    
+leduc <- aggregateFeaturesOverAssays(leduc,
+                                     i = names(leduc)[rawAssays],
+                                     fcol = "Sequence",
+                                     name = peptideAssays,
+                                     fun = sumFunctionMedianSweep
+                            )
+
+leduc <- joinAssays(leduc, i = peptideAssays, 
+                    name = "peptidesSweepNonNorm")
+
+leduc <- sweep(leduc,
+               i="peptidesSweepNonNorm",
+               name="peptidesSweep",
+               MARGIN=2,
+               FUN = "-",
+               STATS = colMedians(assay(leduc[["peptidesSweepNonNorm"]]),
+                                  na.rm = TRUE))
+
+leduc <- filterNA(leduc,
+                  i = "peptidesSweep",
+                  pNA = 0.5)
+```
+
+We plot the intensity-densities of the samples in 4 runs for four assays, corresponding to the following steps in the preprocessing: log-transformation, normalisation, batch correction and the alternative method median sweep.
+
+```{r}
+p1 <- leduc[["peptides_log"]][,colData(leduc)$Set %in% c("eAL00219","wAL00200","eAL00266","wAL00286")] %>% 
+  assay %>%
+  as.data.frame() %>%
+  gather(sample, intensity) %>% 
+  mutate(Set = colData(leduc)[sample,"Set"]) %>%
+  ggplot(aes(x=intensity,group=sample,color=Set)) + 
+    geom_density() +
+    ggtitle("Densities of the intensities") + theme_minimal()
+
+p2 <- leduc[["peptides_norm"]][,colData(leduc)$Set %in% c("eAL00219","wAL00200","eAL00266","wAL00286")] %>% 
+  assay %>%
+  as.data.frame() %>%
+  gather(sample, intensity) %>% 
+  mutate(Set = colData(leduc)[sample,"Set"]) %>%
+  ggplot(aes(x=intensity,group=sample,color=Set)) + 
+    geom_density() + xlab("normalised intensity") +
+    ggtitle("Densities of the normalised intensities") + theme_minimal()
+
+p3 <- leduc[["peptides_batchC"]][,colData(leduc)$Set %in% c("eAL00219","wAL00200","eAL00266","wAL00286")] %>% 
+  assay %>%
+  as.data.frame() %>%
+  gather(sample, intensity) %>% 
+  mutate(Set = colData(leduc)[sample,"Set"]) %>%
+  ggplot(aes(x=intensity,group=sample,color=Set)) + 
+    geom_density() + xlab("batch-corrected intensity") +
+    ggtitle("Densities of the batch-corrected intensities") + theme_minimal()
+
+p4 <- leduc[["peptidesSweep"]][,colData(leduc)$Set %in% c("eAL00219","wAL00200","eAL00266","wAL00286")] %>% 
+  assay %>%
+  as.data.frame() %>%
+  gather(sample, intensity) %>% 
+  mutate(Set = colData(leduc)[sample,"Set"]) %>%
+  ggplot(aes(x=intensity,group=sample,color=Set)) + 
+    geom_density() + xlab("sweeped intensity") +
+    ggtitle("Densities of the sweeped intensities") + theme_minimal()
+
+grid.arrange(p1,p2,p3,p4,ncol=2,nrow=2)
+
+combined <- p1 + p2 + p3 + p4 & theme(legend.position = "bottom")
+combined + plot_layout(guides = "collect") #1000x800
+```
+
+## Imputation sweep 
+
+We finally impute the assay obtained with median sweep.
+
+```{r}
+leduc <- impute(leduc,
+              i = "peptidesSweep",
+              name = "peptidesSweepImp",
+              method = "knn",
+              k = 3, rowmax = 1, colmax= 1,
+              maxp = Inf, rng.seed = 1234)
+```
+
+# Save assays
+
+Save the different obtained assays in the processing for easier later use:
+
+```{r}
+# Save the full QFeatures object
+save(leduc, file = "Data/leduc_summarised.Rda")
+
+# Save a list of the assays from the preprocessing steps
+sces_names <- list("peptides_log", "peptides_norm", "peptides_imptd", "peptides_batchC", "peptidesSweep", "peptidesSweepImp")
+sces <- list()
+for (name in sces_names) {
+  colData(leduc[[name]]) <- colData(leduc)
+  sces[[name]] <- leduc[[name]]
+}
+save(sces, file = "Data/leduc_sces.Rda")
+```
+
+The list of the assays stored in "leduc_sces" will be used in the analyses.
