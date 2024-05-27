@@ -29,7 +29,9 @@ library("car")
 library("mgcv")
 ```
 
-We load the data that was already preprocessed in the scripts "minimal_preprocessing" and "preprocessing_continued". For the illustration of the methods we will work with the assay "peptidesSweepImp" from the original data in "leduc_sces".
+We load the data that was already preprocessed in the scripts "minimal_preprocessing" and
+"preprocessing_continued". For the illustration of the methods we will work with the assay
+"peptidesSweepImp" from the original data in "leduc_sces".
 
 ```{r}
 # function to load the saved preprocessed assays
@@ -71,7 +73,10 @@ intensities <- data.frame("intensities" = c(assay(sce[1,])))
 discretized <- discretize(intensities, 40)
 ```
 
-We define the data we need to fit the model: it contains the discretised sequence, the counts and the carrier. We will use a non-normalised uniform carrier. Then we can fit the desired model. We include the intensities up to the fourth degree for the GLM Poisson model and we also fit a smoothing GAM model.
+We define the data we need to fit the model: it contains the discretised sequence, the counts 
+and the carrier. We will use a non-normalised uniform carrier. Then we can fit the desired model. 
+We include the intensities up to the fourth degree for the GLM Poisson model and 
+we also fit a smoothing GAM model.
 
 ```{r}
 carrier <- rep(sum(discretized$counts)*(discretized$breaks[2]-discretized$breaks[1]),
@@ -84,7 +89,8 @@ model <- glm(counts ~ intensities + I(intensities^2) + I(intensities^3) + I(inte
 model2 <- gam(counts ~ s(intensities) + offset(log(carrier)), data, family = "poisson")
 ```
   
-We can then plot the histogram of the counts and the predicted counts in each interval under the two models.
+We can then plot the histogram of the counts and the predicted counts in each interval 
+under the two models.
 
 ```{r}
 ggplot(data) + geom_bar(aes(x = intensities, y = counts), stat = "identity") +
@@ -93,7 +99,8 @@ ggplot(data) + geom_bar(aes(x = intensities, y = counts), stat = "identity") +
   geom_line(aes(x = intensities, y = model2$fitted.values))
 ```
 
-We now plot frequency histograms where we plot the predicted densities for a sequence of 2000 new data points.
+We now plot frequency histograms where we plot the predicted densities for a sequence
+of 2000 new data points.
 
 ```{r}
 newdata <- data.frame("intensities" = seq(discretized$min, discretized$max, length = 2000),
@@ -107,7 +114,8 @@ ggplot() +
   geom_line(data = predictions, mapping = aes(x = intensities, y = predictions))
 ```
 
-We want to create a plot that compares the densities predicted by the special exponential family method and a kernel density method.
+We want to create a plot that compares the densities predicted by the
+special exponential family method and a kernel density method.
 
 ```{r}
 data_sef <- data.frame("intensities" = discretized$mids,
@@ -159,7 +167,8 @@ ggplot() +
   xlab("Intensities") + ylab("Density") + theme_minimal()
 ```
 
-We create a plot where we fit models of different flexibility on the intensities of one of the peptides:
+We create a plot where we fit models of different flexibility on the intensities
+of one of the peptides:
 
 ```{r}
 intensities <- data.frame("intensities" = c(assay(sce[1,])))
