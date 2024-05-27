@@ -1,0 +1,167 @@
+---
+title: "Dimensionality reduction"
+author: "Fleur Ballet"
+output: html_document
+date: "2024-05-27"
+---
+
+```{r setup, include = FALSE}
+## Options for Rmarkdown compilation
+knitr::opts_chunk$set(fig.width = 7,
+                      fig.height = 5,
+                      fig.align = "center",
+                      out.width = "70%",
+                      message = FALSE,
+                      collapse = TRUE,
+                      crop = NULL, warning = FALSE)
+```
+
+```{r}
+## Single-cell and protoeomics processing tools
+library("scpdata")
+library("scp")
+## Visualization and manipulation tools
+library("ggplot2")
+library("dplyr")
+library("patchwork")
+# PCA
+library("scater")
+```
+
+# Load data
+
+Load the previously processed single-cell experiments.
+Select whether the real data (sces) must be used or the mock data (sces_subset_split or sces_subset_split_per_run) by setting the other lines for "path" to comments.
+
+```{r}
+loadRData <- function(fileName){
+    load(fileName)
+    get(ls()[ls() != "fileName"])
+}
+
+data_path <- "Data/leduc_sces.Rda"
+data_path <- "Data/leduc_sces_subset_split.Rda"
+data_path <- "Data/leduc_sces_subset_split_per_run.Rda"
+
+sces <- loadRData(data_path)
+```
+
+# PCA
+
+Calculate the principal components for each of the considered assays.
+First for the assays of the minimal processing procedure:
+
+```{r}
+mxN <- assay(sces[["peptides_log"]])
+mxN[is.na(mxN)] <- 0
+reducedDim(sces[["peptides_log"]], "PCA") <- runPCA(mxN, rank = 5, scale = TRUE)$rotation
+
+mxN <- assay(sces[["peptides_norm"]])
+mxN[is.na(mxN)] <- 0
+reducedDim(sces[["peptides_norm"]], "PCA") <- runPCA(mxN, rank = 5, scale = TRUE)$rotation
+
+sces[["peptides_imptd"]] <- runPCA(sces[["peptides_imptd"]], 
+                                   ncomponents = 5, ntop = Inf, scale = TRUE,
+                                   exprs_values = 1, name = "PCA")
+
+sces[["peptides_batchC"]] <- runPCA(sces[["peptides_batchC"]], 
+                                    ncomponents = 5, ntop = Inf, scale = TRUE,
+                                    exprs_values = 1, name = "PCA")
+```
+
+And for the assays of the alternative summarisation:
+
+```{r}
+mxS <- assay(sces[["peptidesSweep"]])
+mxS[is.na(mxS)] <- 0             
+reducedDim(sces[["peptidesSweep"]], "PCA") <- runPCA(mxS, rank = 5)$rotation
+reducedDim(sces[["peptidesSweep"]], "PCA_scale") <- runPCA(mxS, rank = 5, scale = TRUE)$rotation
+
+mxS <- assay(sces[["peptidesSweep"]])
+mxS <- sweep(mxS, MARGIN=1, FUN = "-", STATS = rowMedians(mxS, na.rm = TRUE))
+mxS <- sweep(mxS, MARGIN=1, FUN = "/", STATS = rowMads(mxS, na.rm = TRUE))
+mxS[is.na(mxS)] <- 0             
+reducedDim(sces[["peptidesSweep"]], "PCA_scaleMad") <- runPCA(mxS, rank = 5)$rotation
+
+sces[["peptidesSweepImp"]] <- runPCA(sces[["peptidesSweepImp"]], 
+                                    ncomponents = 5, ntop = Inf, scale = TRUE,
+                                    exprs_values = 1, name = "PCA")
+```
+
+# Plots
+
+Now we can plot the PC-projections, where we distinguish the points of different batches and sample types.
+First create the plots:
+
+```{r}
+plotlist <- list()
+for (name in names(sces)) {
+  for (dimred in reducedDimNames(sces[[name]])) {
+    plotlist[[paste0(paste0(name,": ",dimred))]] <- 
+      plotReducedDim(sces[[name]], dimred = dimred, point_alpha = 1,
+                     colour_by = "lcbatch", shape_by = "SampleType") +
+      ggtitle(paste0(paste0(name,": ",dimred)))
+  }
+}
+```
+
+Show the PC-plots of the different assays in one plot:
+
+```{r}
+p1 <- plotlist[["peptides_log: PCA"]]
+p2 <- plotlist[["peptides_norm: PCA"]]
+p3 <- plotlist[["peptides_imptd: PCA"]]
+p4 <- plotlist[["peptides_batchC: PCA"]]
+p5 <- plotlist[["peptidesSweep: PCA"]]
+p6 <- plotlist[["peptidesSweepImp: PCA"]]
+combined <- p1 + p2 + p3 + p4 + p5 + p6 & theme(legend.position = "right")
+combined + plot_layout(guides = "collect") #1200x800
+```
+
+We make another plot to visualise the set effects, but do this on a reduced dataset.
+
+```{r}
+temp<-sces[["peptides_norm"]]
+temp<-temp[,colData(temp)[["Set"]]%in%c("eAL00219","wAL00200","eAL00266","wAL00286")]
+tempassay<-assay(temp)
+tempassay[is.na(tempassay)] <- 0
+reducedDim(temp, "PCA") <- runPCA(tempassay, rank = 5, scale = TRUE)$rotation
+plotReducedDim(temp, dimred = reducedDimNames(temp), point_alpha = 1,
+               colour_by = "Set", shape_by = "SampleType")
+```
+
+We now create several PCA plots in one large figure, again for all the assays, where the points are coloured according to different variables (SampleType, lcbatch, Channel and Set).
+
+```{r}
+plotlist <- list()
+for (name in names(sces)) {
+  plot1 <- plotReducedDim(sces[[name]], dimred = "PCA", point_alpha = 1,
+                     colour_by = "SampleType", shape_by = "SampleType") + 
+    theme(legend.position = 'none')
+  plot2 <- plotReducedDim(sces[[name]], dimred = "PCA", point_alpha = 1,
+                     colour_by = "lcbatch", shape_by = "SampleType") + 
+    theme(legend.position = 'none')
+  plot3 <- plotReducedDim(sces[[name]], dimred = "PCA", point_alpha = 1,
+                     colour_by = "Channel", shape_by = "SampleType") + 
+    theme(legend.position = 'none')
+  plot4 <- plotReducedDim(sces[[name]], dimred = "PCA", point_alpha = 1,
+                     colour_by = "Set", shape_by = "SampleType") + 
+    theme(legend.position = 'none')
+  plotlist[[name]] <- wrap_elements(plot1 + plot2 + plot3 + plot4 + plot_layout(ncol = 1) +
+    plot_annotation(name, theme = theme(plot.title = 
+                                          element_text(hjust = 0.5, face = 'bold', size = 20))))
+}
+combined <- wrap_plots(plotlist) + plot_layout(ncol = 3, guides = 'collect') + 
+    theme(legend.position = 'bottom')  + 
+  plot_annotation("PCA of Leduc", theme = theme(plot.title = 
+                              element_text(hjust = 0.5, face = 'bold', size = 25))) #1600x2000
+```
+
+# Save data
+
+Save the adapted single-cell experiments. Now the principal components are stored in the SingleCellExperiment objects.
+
+```{r}
+save(sces, file = data_path)
+```
+
