@@ -1,0 +1,645 @@
+---
+title: "Density estimation - multiple groups"
+author: "Fleur Ballet"
+output: html_document
+date: "2024-05-27"
+---
+
+```{r setup, include = FALSE}
+## Options for Rmarkdown compilation
+knitr::opts_chunk$set(fig.width = 7,
+                      fig.height = 5,
+                      fig.align = "center",
+                      out.width = "70%",
+                      message = FALSE,
+                      collapse = TRUE,
+                      crop = NULL, warning = FALSE)
+```
+
+In this script we implement the Poisson regression density estimation procedure 
+where we account for different groups of samples, i.e. we fit a different density 
+for the two cells types "Monocytes" and "Melanoma cells" (or "Monocytetype1" and 
+"Monocytetype2" when working with mock data).
+
+Loading the packages:
+
+```{r}
+library("scp")
+library("ggplot2")
+library("dplyr")
+library("patchwork")
+library("car")
+library("mgcv")
+library("tibble")
+```
+
+We load the data that was already preprocessed in the scripts "minimal_preprocessing" and
+"preprocessing_continued". Select whether the real data (sces) or the mock data 
+(sces_subset_split or sces_subset_split_per_run) should be chosen.
+We will work with the assay "peptidesSweepImp", but another assay can be chosen. 
+
+We will fit the models by including interactions between intensity and SampleType, 
+so that we have a density for each cell type.
+
+```{r}
+loadRData <- function(fileName){
+    load(fileName)
+    get(ls()[ls() != "fileName"])
+}
+
+## Select which data must be used
+data_type <- "sces" # real data
+#data_type <- "sces_subset_split" # mock data - random fake sample types to each entry
+#data_type <- "sces_subset_split_per_run" # mock data - random fake sample types to whole runs
+assay <- "peptidesSweepImp"
+
+if (data_type == "sces") {
+  sces <- loadRData("Data/leduc_sces.Rda")
+  sce <- sces[[assay]]
+  colData(sce)[["SampleType"]] <- ifelse(colData(sce)[["SampleType"]] == "Melanoma cell", 
+                                         "Melanoma", "Monocyte") # rename for easier use
+} else if (data_type == "sces_subset_split") {
+  sces <- loadRData("Data/leduc_sces_subset_split.Rda")
+  sce <- sces[[assay]]
+} else if (data_type == "sces_subset_split_per_run") {
+  sces <- loadRData("Data/leduc_sces_subset_split_per_run.Rda")
+  sce <- sces[[assay]]
+}
+
+```
+
+# Functions
+
+We define the necessary functions.
+The first groups of functions need to be applied in the correct order as described. 
+This is, the data need to be correctly formatted, and the assay and peptide we want 
+to look at need to be extracted beforehand. It allows to execute only parts of the process.
+Functions later in this script apply this procedure immediately.
+
+Functions to do the formatting of the data and the fitting of the models:
+
+```{r}
+# Split the data into a list of datasets, 
+# each containing the peptide intensities for one category of the specified variable
+split_intensities_data <- function(sce, data, variable) {
+  groups <- unique(colData(sce)[,variable])
+  split_data <- list()
+  for (group in groups) {
+    split_data[[group]] <- data[which(colData(sce)[[variable]] == group)]
+  }
+  return (split_data)
+}
+
+# Discretize the data in n_bars intervals
+# Define the intervals based on the full dataset and the counts
+# Then count the intensities of the different datasets in split_data
+discretize_split <- function(data, split_data, n_bars) {
+  # discretize
+  min <- min(data)
+  max <- max(data)
+  bar_width <- (max - min)/n_bars
+  breaks <- seq(from = min, to = max, by = bar_width)
+  mids <- seq(from = min+bar_width/2, length.out = length(breaks)-1, by = bar_width)
+  groups <- names(split_data)
+  
+  # count the intensities in each interval for each category
+  counts <- list()
+  for (group in groups) {
+    counts[[group]] <- sapply(1:(length(breaks)-1), 
+                   function(b) sum(split_data[[group]] > breaks[b] & 
+                                     split_data[[group]] < breaks[b+1]))
+  }
+  
+  # store results
+  results <- list(n_bars, min, max, bar_width, breaks, mids, counts, groups)
+  names(results) <- c("n_bars", "min", "max", "bar_width", "breaks", "mids", "counts", "groups")
+  return (results)
+}
+
+# Format the data so that it can be passed to fit the models
+# The models need the sample type, intensities and carrier
+format_data_split_long <- function(discretized, carrier = "uniform") {
+  length <- length(discretized$mids)
+  data_long <- list()
+  for (group in discretized$groups) {
+    subdata <- list()
+    subdata[["SampleType"]] <- rep(group, length)
+    subdata[["intensities"]] <- discretized$mids
+    subdata[["counts"]] <- discretized$counts[[group]]
+    if (carrier == "uniform") {
+      subdata[["carrier"]] <- rep(sum(discretized$counts[[group]])*
+                                      (discretized$breaks[2]-discretized$breaks[1]), length)
+    }
+    data_long <- rbind(data_long, as.data.frame(subdata))
+  }
+  data_long <- as.data.frame(data_long)
+  return (data_long)
+}
+
+# Fit a Poisson model
+# The data need to be formatted as after applying format_data_split_long
+# Possible model types:
+# - Default is "glm": pass the desired predictors
+# - If "gam": the predictors will be smoothed; if "by" variable is passed, this is included
+fit_model <- function(data, predictors, type = "glm", by = NULL) {
+  if (type == "glm") {
+    model <- glm(as.formula(paste("counts", paste(predictors, collapse = "+"), sep = "~")), 
+                 data, offset = log(carrier), family = "poisson")
+  } else if (type == "gam") {
+    model <- gam(as.formula(paste0("counts ~ s(", paste(predictors, collapse = ","), 
+                                   paste(", by =", paste0(by, ")")))), 
+                 data, offset = log(carrier), family = "poisson")
+  }
+  return (model)
+}
+
+# Make and format the new prediction data and immediately add the made predictions
+# "length" specifies the number of new data points in the interval of "discretized"
+# Alse pass the model with which we want to make predictions
+format_prediction_data_split_long <- function(discretized, length, model, carrier = "uniform") {
+  # define the new data
+  data_long <- list()
+  for (group in discretized$groups) {
+    subdata <- list()
+    subdata[["SampleType"]] <- rep(group, length)
+    subdata[["intensities"]] <- seq(discretized$min, discretized$max, length = length)
+    if (carrier == "uniform") {
+      subdata[["carrier"]] <- rep(1, length)
+    }
+    data_long <- rbind(data_long, as.data.frame(subdata))
+  }
+  data_long <- as.data.frame(data_long)
+  
+  # do the predictions
+  data_long[["predictions"]] <- predict(model, newdata = data_long, type = "response")
+  return (data_long)
+}
+
+# Transform the split (as with split_intensities_data) intensity-assays to long data
+format_intensities_long <- function(split_intensities) {
+  data_long <- list()
+  for (group in names(split_intensities)) {
+    length <- length(split_intensities[[group]])
+    subdata <- list()
+    subdata[["SampleType"]] <- rep(group, length)
+    subdata[["intensities"]] <- split_intensities[[group]]
+    data_long <- rbind(data_long, as.data.frame(subdata))
+  }
+  data_long <- as.data.frame(data_long)
+  return (data_long)
+}
+
+# Fit multiple models
+# "data" need to be the data as formatted with format_data_split_long
+# "degrees" is the order until which the main effects for "intensities" need to be included in the model
+# "degrees_interactions" is the order until which the interactions of intensities with SampleType need to be included
+# if "smooth": also a gam model will be fitted
+# Return a list of the models
+fit_models_all_degrees <- function(data, degrees, degrees_interactions, smooth) {
+  models <- list()
+  for (degree in degrees) {
+    predictors <- c("SampleType")
+    if (degree >= 1) {
+      predictors <- append(predictors, "intensities")
+    }
+    if (degree > 1) {
+      for (deg in 2:degree) {
+        predictors <- append(predictors, paste0(paste0("I(intensities^",deg),")"))
+      }
+    }
+    if (length(degrees_interactions) > 0) {
+      if (1 %in% degrees_interactions) {
+        models[[paste0("GLM",deg,0)]] <- fit_model(data, predictors)
+      }
+      predictors <- append(predictors, "SampleType:intensities")
+      if (1 %in% degrees_interactions) {
+        models[[paste0("GLM",deg,1)]] <- fit_model(data, predictors)
+      }
+    }
+    for (deg_inter in degrees_interactions) {
+      if (deg_inter > 1) {
+        predictors <- append(predictors, paste0(paste0("SampleType:I(intensities^",deg_inter),")"))
+        models[[paste0("GLM",deg,deg_inter)]] <- fit_model(data, predictors)
+      }
+    }
+  }
+  if (smooth) {
+    models[["GAM"]] <- fit_model(data, c("intensities"), "gam", "as.factor(SampleType)")
+    models[["GAM0"]] <- fit_model(data, c("intensities"), "gam")
+  }
+  return (models)
+}
+```
+
+Functions for hypothesis testing:
+
+```{r}
+# Calculate the deviance of the models
+get_deviance_models <- function(models) {
+  print("Deviance:")
+  for (name in names(models)) {
+    cat(name,": ",deviance(models[[name]]),"\n")
+  }
+} 
+
+# Perform a deviance test for the model
+deviance_test <- function(model) {
+  return (pchisq(model$deviance, model$df.residual, lower.tail = FALSE))
+}
+
+# Perform a Wald test for the model, 
+# where we test for the combination of parameters in "coeffs"
+# This function is not applicable for the gam models
+wald_test <- function(model, coeffs) {
+  indices <- which(names(coef(model)) %in% coeffs)
+  contrast <- cbind(matrix(rep(0, length(indices)*length(coef(model))), nrow = length(indices)))
+  for (i in 1:length(indices)) {
+    contrast[i,indices[i]] <- 1
+  }
+  test_stat <- t(contrast %*% coef(model)) %*% 
+    solve(contrast %*% vcov(model) %*% t(contrast)) %*% 
+    (contrast %*% coef(model))
+  p_value <- pchisq(test_stat, df = length(indices), lower.tail = FALSE)
+  return (p_value)
+}
+
+# Perform a likelihood ratio test for a model compared to a null model
+lr_test <- function(model, null_model) {
+  test <- anova(null_model, model, test = "Chisq")
+  p_value <- test[2, "Pr(>Chi)"]
+  return (p_value)
+}
+
+# Perform a deviance, likelihood ratio or Wald test for all the models
+# return the p-values
+test_all <- function(models, test) {
+  p_values <- list()
+  for (name in names(models)[sapply(names(models), function(x) !(x %in% c("GLM40","GAM0")))]) {
+    model <- models[[name]]
+    if (test == "deviance_test") {
+      p_values[[name]] <- match.fun(test)(model)
+    } else if (test == "lr_test") {
+      if (name == "GAM") {
+        null_model <- models[["GAM0"]]
+      } else {
+        null_model <- models[["GLM40"]]
+      }
+      p_values[[name]] <- match.fun(test)(model, null_model)
+    } else if (test == "wald_test") {
+      if (name == "GAM") {
+        p_values[[name]] <- NA
+      } else{
+        coeffs <- names(coef(model))[unlist(lapply(names(coef(model)), function(x) grepl(":", x)))]
+        p_values[[name]] <- match.fun(test)(model, coeffs)
+      }
+    }
+  }
+  p_values <- cbind(p_values, p.adjust(p_values, method = "BH"))
+  colnames(p_values) <- c("P-value", "Adj-P-value")
+  return (p_values)
+}
+
+# Print a list nicely
+print_list <- function(list, name) {
+  print(name)
+  for (item in names(list)) {
+    cat(item,": ",list[[item]],"\n")
+  }
+}
+
+# Print the p-values of the different tests together to get a nice table to export
+print_all_pvalues <- function(list_p) {
+  p_values <- do.call(cbind, list_p)
+  colnames(p_values) <- sapply(1:length(colnames(p_values)), 
+                               function(i) paste(names(list_p)[(i+1)/2], colnames(p_values)[i]))
+  return (p_values)
+}
+```
+
+Function to plot the predictions of the models on the original histograms:
+
+```{r}
+# Plot the histograms for all the categories of sample type
+# Plot the predictions for the given model for all categories on top
+# The data need to be formatted as with split_intensities_long
+plot_intensities_prediction <- function(split_intensities_long, discretized, model, name = NULL) {
+  newdata_long <- format_prediction_data_split_long(discretized, 2000, model)
+  
+  ggplot() + 
+    geom_histogram(data = split_intensities_long, breaks = discretized$breaks,
+                   mapping = aes(x = intensities, y = after_stat(density), 
+                             fill = SampleType, color = SampleType, alpha = SampleType),
+                   position = "dodge") + 
+    geom_line(data = newdata_long, aes(x = intensities, y = predictions, color = SampleType)) +
+    scale_colour_manual(values = c("darkblue", "red")) +
+    scale_fill_manual(values = c("lightblue", "pink")) +
+    scale_alpha_manual(values = c(0.5, 0.5)) +
+    xlab("Intensities") + ylab("Density") +
+    ggtitle(name) + theme_minimal()
+}
+
+# Plot the histograms and prediction for all the models
+# returns a list with the plots
+plot_all_models <- function(split_intensities_long, discretized, models) {
+  plotlist <- list()
+  for (name in names(models)) {
+    plotlist[[name]] <- plot_intensities_prediction(split_intensities_long, 
+                                                    discretized, models[[name]], name)
+  }
+  return (plotlist)
+}
+```
+
+Functions to apply the full procedure to fit the models. We can immediately test or plot the fits.
+These can be applied to a desired assay and peptide.
+
+```{r}
+# Fit Poisson models on the intensities of a certain peptide in a certain assay sce
+# It fits GLM models where the main effect of "intensities" is included up to the 4th order
+# and also "intensities" to the 4th order in interactions with SampleType
+# It also fit GAM models for each SampleType
+# Returns a list with the p-values
+model_and_test <- function(peptide, sce) {
+  
+  # Prepare the data
+  intensities <- assay(sce[peptide,])
+  split_intensities <- split_intensities_data(sce, intensities, "SampleType")
+  split_intensities_long <- format_intensities_long(split_intensities)
+  discretized <- discretize_split(intensities, split_intensities, 40)
+  data_long <- format_data_split_long(discretized)
+  
+  # Fit the models
+  models <- fit_models_all_degrees(data_long, 4, 0:4, TRUE)
+  
+  # Test significance SampleType
+  p_dev <- test_all(models, "deviance_test")
+  p_wald <- test_all(models, "wald_test")
+  p_lr <- test_all(models, "lr_test")
+  
+  results <- list("p_dev" = p_dev, "p_wald" = p_wald, "p_lr" = p_lr)
+  return (results)
+}
+
+# Fit Poisson models on the intensities of all the peptides in a certain assay sce
+# It fits GLM models where the main effect of "intensities" is included up to the 4th order
+# and also "intensities" to the 4th order in interactions with SampleType
+# It also fit GAM models for each SampleType
+# Returns a list with the plots
+model_and_test_all <- function(sce) {
+  results <- list()
+  for (peptide in rownames(sce)) {
+    results[[peptide]] <- model_and_test(peptide, sce)
+  }
+  return (results)
+}
+
+# Extract the p-values from the tests on the models 
+get_p_values <- function(results, type) {
+  if (type == "dev") {
+    p_values <- lapply(results, function(x) x$p_dev)
+  } else if (type == "wald") {
+    p_values <- lapply(results, function(x) x$p_wald)
+  } else if (type == "lr") {
+    p_values <- lapply(results, function(x) x$p_lr)
+  }
+  names(p_values) <- names(results)
+  return (p_values)
+}
+
+
+# Extract the p-values of a certain model over the different peptides
+get_p_values_per_model <- function(results, type) {
+  p_values_all <- get_p_values(results, type)
+  p_values <- list()
+  for (name in rownames(results[[1]][[1]])) {
+    p_values_model <- do.call(rbind, sapply(p_values_all, 
+                                                         function(x) x[name, "P-value"]))
+    p_values_model <- cbind(p_values_model, p.adjust(p_values_model, method = "BH"))
+    colnames(p_values_model) <- c("P-value", "Adj-P-value")
+    p_values[[name]] <- p_values_model
+  }
+  return (p_values)
+}
+
+# Extract the peptides with significant p-values per model
+get_significant_peptides_per_model <- function(p_values, model) {
+  sigNames <- p_values[[model]] %>% as.data.frame %>% rownames_to_column("peptides") %>%
+    filter(`Adj-P-value` < 0.05) %>% pull("peptides")
+  return (sigNames)
+}
+
+# Extract the peptides with significant p-values of all models
+get_significant_peptides <- function(p_values) {
+  sigNames <- list()
+  sigNames <- sapply(names(p_values), function(name)
+                                       get_significant_peptides_per_model(p_values, name))
+  return (sigNames)
+}
+
+# To print a nice table with the number of (significant) peptides per assay to export
+print_nr_sign_pept <- function(p_values) {
+  numbers <- list()
+  numbers[["Nr significant"]] <- sapply(names(p_values), function(name)
+                                  length(get_significant_peptides_per_model(p_values, name)))
+  numbers[["Nr peptides"]] <- sapply(names(p_values), function(name)
+                                         nrow(p_values[[name]]))
+  numbers[["Ratio"]] <- numbers[["Nr significant"]]/numbers[["Nr peptides"]]
+  numbers <- as.data.frame(numbers)
+  return (numbers)
+}
+```
+
+Functions for plotting the intensities: 
+
+```{r}
+# Fit a Poisson model on the intensities of a certain peptide in a certain assay sce
+# Model types can be "glm" and "gam"
+# Add the desired predictors
+fit_and_plot_intensities <- function(peptide, sce, predictors, type = "glm", by = NULL) {
+  
+  # Prepare the data
+  intensities <- assay(sce[peptide,])
+  split_intensities <- split_intensities_data(sce, intensities, "SampleType")
+  split_intensities_long <- format_intensities_long(split_intensities)
+  discretized <- discretize_split(intensities, split_intensities, 40)
+  data_long <- format_data_split_long(discretized)
+  
+  # Fit the model
+  model <- fit_model(data = data_long, predictors, type, by)
+  
+  # Make the predictions
+  plot_intensities_prediction(split_intensities_long, discretized, model)
+}
+
+# Fit Poisson models on the intensities of a certain peptide in a certain assay sce
+# It fits GLM models where the main effect of "intensities" is included up to the 4th order
+# and also "intensities" to the 4th order in interactions with SampleType
+# It also fit GAM models for each SampleType
+# Returns a list with the plots
+fit_all_and_plot_intensities <- function(peptide, sce) {
+  
+  # Prepare the data
+  intensities <- assay(sce[peptide,])
+  split_intensities <- split_intensities_data(sce, intensities, "SampleType")
+  split_intensities_long <- format_intensities_long(split_intensities)
+  discretized <- discretize_split(intensities, split_intensities, 40)
+  data_long <- format_data_split_long(discretized)
+  
+  # Fit the models
+  models <- fit_models_all_degrees(data_long, 4, 0:4, TRUE)
+  
+  plotlist <- list()
+  for (name in names(models)[sapply(names(models), function(x) !(x %in% c("GLM40","GAM0")))]) {
+    plotlist[[name]] <- plot_intensities_prediction(split_intensities_long, 
+                                                    discretized, models[[name]], name)
+  }
+  return (plotlist)
+}
+```
+
+Functions for plotting the p-values:
+
+```{r}
+# Make a histogram of the p-values of a certain model
+plot_p_values <- function(p_values, name, type = "P-value", test = "") {
+  d <- as.data.frame(p_values[[name]][,type])
+  colnames(d) <- c("p_values")
+  ggplot(data = d, aes(x = p_values)) + 
+        geom_histogram(color = "black", fill = "gray") + 
+        labs(title = paste0(test," test: ",name), x = type, y = "Frequency") + theme_minimal()
+}
+
+# Make for every model a histogram of the p-values
+plot_p_values_all <- function(p_values, type = "P-value", test = "") {
+  plotlist <- list()
+  for (name in names(p_values)) {
+    plotlist[[name]] <- plot_p_values(p_values, name, type, test)
+  }
+  return (plotlist)
+}
+```
+
+# Application
+
+## Example on one peptide
+
+We illustrate the procedure with the first peptide. We first format the data:
+
+```{r}
+intensities <- assay(sce[1,])
+split_intensities <- split_intensities_data(sce, intensities, "SampleType")
+split_intensities_long <- format_intensities_long(split_intensities)
+discretized <- discretize_split(intensities, split_intensities, 40)
+data_long <- format_data_split_long(discretized)
+```
+
+We fit one model on the data and make predictions on new data points to illustrate the outcome:
+
+```{r}
+model <- glm(counts ~ SampleType + intensities + I(intensities^2) + I(intensities^3) + 
+               I(intensities^4) + SampleType:intensities + SampleType:I(intensities^2) +
+               SampleType:I(intensities^3) + SampleType:I(intensities^4),
+             offset = offset(log(carrier)), data = data_long, family = "poisson")
+
+newdata_long <- format_prediction_data_split_long(discretized, 2000, model)
+
+ggplot() + 
+  geom_histogram(data = split_intensities_long, breaks = discretized$breaks,
+                 mapping = aes(x = intensities, y = after_stat(density), 
+                           fill = SampleType, color = SampleType, alpha = SampleType),
+                 position = "dodge") + 
+  geom_line(data = newdata_long, aes(x = intensities, y = predictions, color = SampleType)) +
+  scale_colour_manual(values = c("darkblue", "red")) +
+  scale_fill_manual(values = c("lightblue", "pink")) +
+  scale_alpha_manual(values = c(0.5, 0.5)) +
+  xlab("Intensities") + ylab("Density")
+```
+
+We now fit all the models that we want to compare. Then we perform the hypotheses tests.
+
+```{r}
+models <- fit_models_all_degrees(data_long, 4, 0:4, TRUE)
+
+p_dev <- test_all(models, "deviance_test")
+p_wald <- test_all(models, "wald_test")
+p_lr <- test_all(models, "lr_test")
+
+p_values <- print_all_pvalues(list("Deviance" = p_dev, "Wald" = p_wald, "LR" = p_lr))
+print(p_values)
+```
+
+We plot the predictions on the histograms for all models, 
+so that we can visually inspect the fit of the models.
+
+```{r}
+plotlist <- plot_all_models(split_intensities_long, discretized, models)
+
+p1 <- plotlist[["GLM40"]]
+p2 <- plotlist[["GLM41"]]
+p3 <- plotlist[["GLM42"]]
+p4 <- plotlist[["GLM43"]]
+p5 <- plotlist[["GLM44"]]
+p6 <- plotlist[["GAM0"]]
+p7 <- plotlist[["GAM"]]
+combined <- p1 + p2 + p3 + p4 + p5 + plot_spacer() + p6 + p7 & theme(legend.position = 'bottom')
+combined + plot_layout(ncol = 2, guides = "collect") # 1200x1200
+```
+
+## Procedure for all peptides
+
+For all the peptides in the assay sce, we fit the models and perform hypotheses tests. 
+We so obtain the p-values for all the peptides and can determine for which peptides 
+and models the difference is significant.
+
+```{r}
+results <- model_and_test_all(sce)
+#load(paste0("Results/leduc_",datatype,"_results_sef_all.Rda")) # can load if already stored
+
+p_values_dev <- get_p_values_per_model(results, "dev")
+p_values_wald <- get_p_values_per_model(results, "wald")
+p_values_lr <- get_p_values_per_model(results, "lr")
+p_values_all <- list("Deviance" = p_values_dev, "Wald" = p_values_wald, "LR" = p_values_lr)
+
+sign_dev <- get_significant_peptides(p_values_dev)
+sign_wald <- get_significant_peptides(p_values_wald)
+sign_lr <- get_significant_peptides(p_values_lr)
+sign_all <- list("Deviance" = sign_dev, "Wald" = sign_wald, "LR" = sign_lr)
+
+print_nr_sign_pept(p_values_dev)
+print_nr_sign_pept(p_values_wald)
+print_nr_sign_pept(p_values_lr)
+```
+
+Save the results:
+
+```{r}
+save(results, file = paste0("Results/leduc_",data_type,"_results_sef_all.Rda"))
+```
+
+
+We fit a histogram of the p-values of the results. 
+Choose one of the test of which to print the results by uncommenting the line:
+
+```{r}
+#plotlist <- plot_p_values_all(p_values_dev, "P-value", "Deviance")
+#plotlist <- plot_p_values_all(p_values_dev, "Adj-P-value", "Deviance")
+
+#plotlist <- plot_p_values_all(p_values_wald, "P-value", "Wald")
+#plotlist <- plot_p_values_all(p_values_wald, "Adj-P-value", "Wald")
+
+plotlist <- plot_p_values_all(p_values_lr, "P-value", "LR")
+#plotlist <- plot_p_values_all(p_values_lr, "Adj-P-value", "LR")
+```
+
+```{r}
+p2 <- plotlist[["GLM41"]]
+p3 <- plotlist[["GLM42"]]
+p4 <- plotlist[["GLM43"]]
+p5 <- plotlist[["GLM44"]]
+p6 <- plotlist[["GAM"]]
+combined <- p2 + p3 + p4 + p5 + p6 & theme(legend.position = "right")
+combined + plot_layout(ncol = 2, guides = "collect") # 1200x700 or 1200x1000
+```
+
+
+

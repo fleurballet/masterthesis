@@ -31,7 +31,8 @@ library("scater")
 # Load data
 
 Load the previously processed single-cell experiments.
-Select whether the real data (sces) must be used or the mock data (sces_subset_split or sces_subset_split_per_run) by setting the other lines for "path" to comments.
+Select whether the real data (sces) must be used or the mock data (sces_subset_split or
+sces_subset_split_per_run) by setting the other lines for "path" to comments.
 
 ```{r}
 loadRData <- function(fileName){
@@ -90,7 +91,8 @@ sces[["peptidesSweepImp"]] <- runPCA(sces[["peptidesSweepImp"]],
 
 # Plots
 
-Now we can plot the PC-projections, where we distinguish the points of different batches and sample types.
+Now we can plot the PC-projections, where we distinguish the points of different 
+batches and sample types.
 First create the plots:
 
 ```{r}
@@ -130,7 +132,8 @@ plotReducedDim(temp, dimred = reducedDimNames(temp), point_alpha = 1,
                colour_by = "Set", shape_by = "SampleType")
 ```
 
-We now create several PCA plots in one large figure, again for all the assays, where the points are coloured according to different variables (SampleType, lcbatch, Channel and Set).
+We now create several PCA plots in one large figure, again for all the assays, where the 
+points are coloured according to different variables (SampleType, lcbatch, Channel and Set).
 
 ```{r}
 plotlist <- list()
@@ -159,7 +162,8 @@ combined <- wrap_plots(plotlist) + plot_layout(ncol = 3, guides = 'collect') +
 
 # Save data
 
-Save the adapted single-cell experiments. Now the principal components are stored in the SingleCellExperiment objects.
+Save the adapted single-cell experiments. Now the principal components are 
+stored in the SingleCellExperiment objects.
 
 ```{r}
 save(sces, file = data_path)

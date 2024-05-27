@@ -126,7 +126,8 @@ create_dataset_for_all <- function(func, sces, args) {
 
 # Create new datasets
 
-First load the data. This is a list of SingleCellExperiment-assays (as created after "minimal_preprocessing" and "preprocessing_continued").
+First load the data. This is a list of SingleCellExperiment-assays 
+(as created after "minimal_preprocessing" and "preprocessing_continued").
 
 ```{r}
 loadRData <- function(fileName){
@@ -153,4 +154,5 @@ save(sces_subset_split, file = "Data/leduc_sces_subset_split.Rda")
 save(sces_subset_split_per_run, file = "Data/leduc_sces_subset_split_per_run.Rda")
 ```
 
-For the rest of the analyses, we will use "sces" (the real data), and "sces_subset_split" and "sces_subset_split_per_run" (the mock data).
+For the rest of the analyses, we will use "sces" (the real data),
+and "sces_subset_split" and "sces_subset_split_per_run" (the mock data).
