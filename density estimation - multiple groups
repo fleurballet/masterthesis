@@ -555,7 +555,8 @@ ggplot() +
   xlab("Intensities") + ylab("Density")
 ```
 
-We now fit all the models that we want to compare. Then we perform the hypotheses tests.
+We now fit all the models that we want to compare  (GLM41, GLM42, GLM43, GLM44 and GAM,
+and their respective null models GLM40 and GAM0). Then we perform the hypotheses tests.
 
 ```{r}
 models <- fit_models_all_degrees(data_long, 4, 0:4, TRUE)
